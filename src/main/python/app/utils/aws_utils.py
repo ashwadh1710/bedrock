@@ -3,23 +3,163 @@ import json
 from botocore.exceptions import ClientError
 from typing import Dict, Any, List, Union, Optional
 import logging
+import requests
+
 
 logger = logging.getLogger(__name__)
 
 class AWSUtils:
-    def __init__(self):
+    def __init__(self, profile_name: str = None, region: str = None):
         """
-        Initialize AWS clients using EC2 instance IAM role credentials.
-        boto3 will automatically use the IAM role credentials when running on EC2.
+        Initialize AWS clients with automatic detection of execution environment.
+
+        Args:
+            profile_name (str, optional): AWS profile name for local development
+            region (str, optional): AWS region to use
         """
-        self.s3_client = boto3.client('s3')
-        self.lambda_client = boto3.client('lambda')
-        self.bedrock_runtime = boto3.client('bedrock-runtime')
-        self.s3_client = boto3.client('s3')
-        self.lambda_client = boto3.client('lambda')
-        self.bedrock_runtime = boto3.client('bedrock-runtime')
-        self.ec2_client = boto3.client('ec2')
-        self.sts_client = boto3.client('sts')
+        self.is_ec2 = self._is_running_on_ec2()
+        self.session = self._initialize_session(profile_name, region)
+
+        # Initialize clients using the session
+        self.s3_client = self.session.client('s3')
+        self.lambda_client = self.session.client('lambda')
+        self.bedrock_runtime = self.session.client('bedrock-runtime')
+        self.ec2_client = self.session.client('ec2')
+        self.sts_client = self.session.client('sts')
+
+    def _is_running_on_ec2(self) -> bool:
+        """
+        Check if the code is running on an EC2 instance
+
+        Returns:
+            bool: True if running on EC2, False otherwise
+        """
+        try:
+            # Try to access EC2 instance metadata service with a timeout of 1 second
+            requests.get('http://169.254.169.254/latest/meta-data/', timeout=1)
+            return True
+        except (requests.RequestException, requests.Timeout):
+            return False
+
+    def _initialize_session(self, profile_name: str = None, region: str = None) -> boto3.Session:
+        """
+        Initialize AWS session based on the execution environment
+
+        Args:
+            profile_name (str, optional): AWS profile name for local development
+            region (str, optional): AWS region to use
+
+        Returns:
+            boto3.Session: Configured AWS session
+        """
+        if self.is_ec2:
+            logger.info("Running on EC2, using instance metadata for credentials")
+            return boto3.Session(region_name=region)
+        else:
+            logger.info("Running locally, using profile or environment credentials")
+            return boto3.Session(profile_name=profile_name, region_name=region)
+
+    def setup_local_credentials(self,
+                                aws_access_key_id: str,
+                                aws_secret_access_key: str,
+                                region: str = 'us-east-1',
+                                profile_name: str = 'default') -> bool:
+        """
+        Set up AWS credentials file for local development
+
+        Args:
+            aws_access_key_id (str): AWS access key ID
+            aws_secret_access_key (str): AWS secret access key
+            region (str, optional): AWS region
+            profile_name (str, optional): AWS profile name
+
+        Returns:
+            bool: True if credentials were set up successfully, False otherwise
+        """
+        if self.is_ec2:
+            logger.warning("Running on EC2, no need to set up local credentials")
+            return False
+
+        try:
+            # Create ~/.aws directory if it doesn't exist
+            aws_dir = Path.home() / '.aws'
+            aws_dir.mkdir(exist_ok=True)
+
+            # Initialize config parser
+            config = configparser.ConfigParser()
+
+            # Read existing credentials file if it exists
+            credentials_file = aws_dir / 'credentials'
+            if credentials_file.exists():
+                config.read(credentials_file)
+
+            # Add or update profile
+            if not config.has_section(profile_name):
+                config.add_section(profile_name)
+
+            config[profile_name]['aws_access_key_id'] = aws_access_key_id
+            config[profile_name]['aws_secret_access_key'] = aws_secret_access_key
+
+            # Write credentials file
+            with open(credentials_file, 'w') as f:
+                config.write(f)
+
+            # Update config file with region
+            config_file = aws_dir / 'config'
+            config = configparser.ConfigParser()
+
+            if config_file.exists():
+                config.read(config_file)
+
+            profile_section = f"profile {profile_name}" if profile_name != "default" else "default"
+            if not config.has_section(profile_section):
+                config.add_section(profile_section)
+
+            config[profile_section]['region'] = region
+
+            with open(config_file, 'w') as f:
+                config.write(f)
+
+            # Reinitialize the session with new credentials
+            self.session = self._initialize_session(profile_name, region)
+
+            # Reinitialize clients with new session
+            self.s3_client = self.session.client('s3')
+            self.lambda_client = self.session.client('lambda')
+            self.bedrock_runtime = self.session.client('bedrock-runtime')
+            self.ec2_client = self.session.client('ec2')
+            self.sts_client = self.session.client('sts')
+
+            logger.info(f"Successfully set up AWS credentials for profile: {profile_name}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error setting up AWS credentials: {str(e)}")
+            return False
+
+    def verify_credentials(self) -> Dict[str, Any]:
+        """
+        Verify AWS credentials are working and return account information
+
+        Returns:
+            dict: Account information and credentials status
+        """
+        try:
+            response = self.sts_client.get_caller_identity()
+            return {
+                'status': 'valid',
+                'account_id': response['Account'],
+                'arn': response['Arn'],
+                'user_id': response['UserId'],
+                'environment': 'ec2' if self.is_ec2 else 'local'
+            }
+        except Exception as e:
+            return {
+                'status': 'invalid',
+                'error': str(e),
+                'environment': 'ec2' if self.is_ec2 else 'local'
+            }
+
 
     # S3 Operations
     def upload_to_s3(self, file_content: Union[bytes, str], bucket: str, key: str) -> bool:
@@ -221,6 +361,34 @@ class AWSUtils:
         except Exception as e:
             logger.error(f"Error getting account ID from AZ: {str(e)}")
             return None
+
+# # Example test setup
+# def setup_test_environment():
+#     # For local testing
+#     aws_utils = AWSUtils(profile_name='test')
+#
+#     # Set up test credentials if needed
+#     if not aws_utils.is_ec2:
+#         aws_utils.setup_local_credentials(
+#             aws_access_key_id='TEST_ACCESS_KEY_ID',
+#             aws_secret_access_key='TEST_SECRET_ACCESS_KEY',
+#             region='us-west-2',
+#             profile_name='test'
+#         )
+#
+#     return aws_utils
+#
+# # In your tests
+# def test_aws_operations():
+#     aws_utils = setup_test_environment()
+#
+#     # Verify credentials are working
+#     creds_status = aws_utils.verify_credentials()
+#     assert creds_status['status'] == 'valid'
+#
+#     # Test AWS operations
+#     result = aws_utils.list_s3_objects('test-bucket')
+#     # Add assertions...
 
 
 
