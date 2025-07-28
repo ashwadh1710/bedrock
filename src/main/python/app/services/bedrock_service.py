@@ -1,35 +1,51 @@
-import boto3
+from typing import Dict, Any
 import json
-from app.config.settings import AppConfig
-from app.utils.logger import setup_logger
+import logging
+from app.utils.aws_utils import AWSUtils
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
 class BedrockService:
-    def __init__(self):
-        self.client = self._initialize_client()
+    def __init__(self, aws_utils: AWSUtils):
+        self.aws_utils = aws_utils
+        self.bedrock_runtime = aws_utils.bedrock_runtime
 
-    def _initialize_client(self):
-        return boto3.client(
-            service_name='bedrock-runtime',
-            region_name=AppConfig.AWS_REGION,
-            aws_access_key_id=AppConfig.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AppConfig.AWS_SECRET_ACCESS_KEY
-        )
+    def invoke_model(self, prompt: str) -> Dict[str, Any]:
+        """
+        Invoke AWS Bedrock model with the given prompt
 
-    def invoke_model(self, prompt, max_tokens=512):
+        Args:
+            prompt (str): The prompt to send to the model
+
+        Returns:
+            Dict[str, Any]: Model response
+        """
         try:
+            # Configure the request body for Claude model
             request_body = {
                 "prompt": prompt,
-                "maxTokens": max_tokens
+                "max_tokens_to_sample": 2048,
+                "temperature": 0.7,
+                "top_p": 1,
+                "stop_sequences": ["\n\nHuman:"]
             }
 
-            response = self.client.invoke_model(
-                modelId=AppConfig.BEDROCK_MODEL_ID,
+            # Invoke the model
+            response = self.bedrock_runtime.invoke_model(
+                modelId="anthropic.claude-v2",
                 body=json.dumps(request_body)
             )
 
-            return json.loads(response['body'].read())
+            # Parse the response
+            response_body = json.loads(response['body'].read())
+
+            return {
+                "generated_text": response_body.get('completion', ''),
+                "model_id": "anthropic.claude-v2",
+                "prompt_tokens": response_body.get('prompt_tokens', 0),
+                "completion_tokens": response_body.get('completion_tokens', 0)
+            }
+
         except Exception as e:
-            logger.error(f"Error in model invocation: {str(e)}")
+            logger.error(f"Error invoking Bedrock model: {str(e)}")
             raise
